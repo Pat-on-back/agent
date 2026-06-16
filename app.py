@@ -396,8 +396,8 @@ def main() -> None:
             st.session_state.pop(key, None)
 
         try:
-            st.markdown("## 1. 快速识别唯一算法")
-            with st.spinner("正在识别题目类型和本次唯一处理的算法……"):
+            st.markdown("## 1. 快速识别算法")
+            with st.spinner("正在识别题目类型和本次处理的算法……"):
                 plan = detect_single_algorithm(client, model, user_problem)
             st.success(f"识别完成：本次只处理「{plan.get('algorithm_name', '指定算法')}」。")
             st.json(plan)
