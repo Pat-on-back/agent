@@ -4,8 +4,8 @@
 
 设计原则：
 1. 不在本地实现回溯、动态规划、分支限界、遗传算法、模拟退火等求解器。
-2. 算法识别、求解步骤、可视化帧、教学讲解、报告内容全部由硅基流动大模型生成。
-3. 本地程序只做三件事：调用硅基流动 API、渲染大模型返回的可视化 JSON、导出 PDF。
+2. 算法识别、求解步骤、可视化帧、教学讲解、报告内容全部由 OpenAI 兼容接口的大模型生成。
+3. 本地程序只做三件事：调用大模型 API、渲染大模型返回的可视化 JSON、导出 PDF。
 """
 
 import os
@@ -31,8 +31,9 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 
 APP_TITLE = "算法过程可视化"
+# 使用通用 OpenAI 兼容接口配置。硅基流动只需替换 endpoint 即可。
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
-DEFAULT_MODEL = "Qwen/Qwen2.5-72B-Instruct"
+DEFAULT_MODEL = "nex-agi/Nex-N2-Pro"
 
 DEFAULT_SYSTEM_PROMPT = r"""
 你是“算法过程可视化”智能体。你的核心任务不是只给答案，而是把算法求解过程转换为可逐帧展示的可视化数据。
@@ -114,6 +115,24 @@ def get_secret(name: str, default: str = "") -> str:
     except Exception:
         pass
     return os.environ.get(name, default)
+
+
+def get_config(names: List[str], default: str = "") -> str:
+    """按顺序读取配置，优先使用通用 OPENAI_*，兼容旧版 SILICONFLOW_*。"""
+    for name in names:
+        value = get_secret(name, "")
+        if value:
+            return value
+    return default
+
+
+def is_quota_or_permission_error(err: Exception) -> bool:
+    text = str(err).lower()
+    keywords = [
+        "insufficient", "balance", "quota", "403", "30001",
+        "permission", "forbidden", "unauthorized", "invalid api key"
+    ]
+    return any(k in text for k in keywords)
 
 
 def create_client(api_key: str, base_url: str) -> OpenAI:
@@ -352,7 +371,7 @@ def make_pdf(data: Dict[str, Any]) -> str:
     story.append(Paragraph("算法过程可视化", styles["ChineseTitle"]))
     story.append(Paragraph("智能体自动生成的详细求解过程 PDF", styles["ChineseHeading"]))
     story.append(Paragraph("生成时间：" + datetime.now().strftime("%Y-%m-%d %H:%M:%S"), styles["ChineseBody"]))
-    story.append(Paragraph("说明：本 PDF 的题目识别、算法步骤、可视化帧、变量变化和教学报告来自硅基流动大模型输出；程序仅负责把大模型输出排版为 PDF。", styles["ChineseBody"]))
+    story.append(Paragraph("说明：本 PDF 的题目识别、算法步骤、可视化帧、变量变化和教学报告来自 OpenAI 兼容接口的大模型输出；程序仅负责把大模型输出排版为 PDF。", styles["ChineseBody"]))
     story.append(Spacer(1, 0.2 * cm))
 
     story.append(Paragraph("一、题目与识别结果", styles["ChineseHeading"]))
@@ -466,15 +485,16 @@ def make_pdf(data: Dict[str, Any]) -> str:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("基于硅基流动 API 的大模型算法过程可视化：输入题目，大模型生成算法识别、求解过程、可视化帧和 PDF 报告。")
+    st.caption("基于 OpenAI 兼容接口的大模型算法过程可视化：输入题目，大模型生成算法识别、求解过程、可视化帧和 PDF 报告。")
 
     with st.sidebar:
-        st.header("硅基流动 API 配置")
-        api_key = st.text_input("SILICONFLOW_API_KEY", value=get_secret("SILICONFLOW_API_KEY", ""), type="password")
-        base_url = st.text_input("SILICONFLOW_BASE_URL", value=get_secret("SILICONFLOW_BASE_URL", DEFAULT_BASE_URL))
-        model = st.text_input("SILICONFLOW_MODEL", value=get_secret("SILICONFLOW_MODEL", DEFAULT_MODEL))
-        max_frames = st.slider("每种算法最多帧数", min_value=3, max_value=10, value=6)
+        st.header("OpenAI 兼容接口配置")
+        api_key = st.text_input("OPENAI_API_KEY", value=get_config(["OPENAI_API_KEY", "SILICONFLOW_API_KEY"], ""), type="password")
+        base_url = st.text_input("OPENAI_BASE_URL", value=get_config(["OPENAI_BASE_URL", "SILICONFLOW_BASE_URL"], DEFAULT_BASE_URL))
+        model = st.text_input("OPENAI_MODEL", value=get_config(["OPENAI_MODEL", "SILICONFLOW_MODEL"], DEFAULT_MODEL))
+        max_frames = st.slider("每种算法最多帧数", min_value=3, max_value=10, value=5)
         st.markdown("---")
+        st.info("默认使用硅基流动 OpenAI 兼容接口：base_url=https://api.siliconflow.cn/v1，模型 nex-agi/Nex-N2-Pro。")
         st.info("本项目不在本地实现算法求解器；本地只负责调用大模型、渲染可视化和导出 PDF。")
 
     sample = "请可视化求解 01 背包问题。背包容量 15，物品 A 重量2 价值6，B 重量3 价值10，C 重量4 价值12，D 重量5 价值14，E 重量9 价值20，F 重量7 价值18。请用回溯法、动态规划、分支限界、遗传算法、模拟退火进行对比。"
@@ -488,21 +508,29 @@ def main() -> None:
 
     if run:
         if not api_key:
-            st.error("请先配置硅基流动 API Key。")
+            st.error("请先配置 OPENAI_API_KEY。")
             return
         if not user_problem.strip():
             st.error("请输入算法题目。")
             return
 
         client = create_client(api_key, base_url)
-        with st.spinner("正在调用硅基流动大模型生成算法过程可视化……"):
+        with st.spinner("正在调用大模型生成算法过程可视化……"):
             try:
                 data = ask_llm_for_visualization(client, model, user_problem, max_frames)
             except Exception as e:
+                if is_quota_or_permission_error(e):
+                    st.error("接口调用失败：请检查 API Key、模型权限、账户额度，以及模型名是否可用。")
+                    st.code(str(e), language="text")
+                    return
                 st.warning("首次解析 JSON 失败，尝试让大模型修复输出格式。")
                 try:
                     data = repair_json_with_llm(client, model, str(e))
                 except Exception as e2:
+                    if is_quota_or_permission_error(e2):
+                        st.error("接口调用失败：请检查 API Key、模型权限、账户额度，以及模型名是否可用。")
+                        st.code(str(e2), language="text")
+                        return
                     st.error(f"生成失败：{e2}")
                     return
 
