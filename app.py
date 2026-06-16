@@ -372,7 +372,7 @@ def main() -> None:
         model = st.text_input("OPENAI_MODEL", value=get_config(["OPENAI_MODEL", "SILICONFLOW_MODEL"], DEFAULT_MODEL))
         max_frames = st.slider("最多关键帧", 2, 8, 4, help="只处理一种算法。帧数越少，生成越快；录屏建议 4 帧。")
         st.markdown("---")
-        st.info("单算法渲染版：不再生成多算法列表，不做多算法对比。用户输入什么算法，就只处理这一种算法。")
+        st.info("算法执行过程可视化")
 
     sample = "请用动态规划可视化求解 01 背包问题。背包容量 15，物品 A 重量2 价值6，B 重量3 价值10，C 重量4 价值12，D 重量5 价值14，E 重量9 价值20，F 重量7 价值18。"
     user_problem = st.text_area("请输入算法题目", value=sample, height=150)
@@ -381,7 +381,7 @@ def main() -> None:
     with c1:
         run = st.button("生成算法过程可视化", type="primary", use_container_width=True)
     with c2:
-        st.write("当前逻辑：只识别并处理一个算法，然后根据大模型返回的求解分析进行可视化渲染。")
+        st.write("可视化算法过程")
 
     if run:
         if not api_key:
