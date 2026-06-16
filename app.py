@@ -17,6 +17,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
+from queue import Queue, Empty
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -147,7 +148,12 @@ def get_executor() -> ThreadPoolExecutor:
 
 
 def reset_visual_state(clear_input: bool = False) -> None:
-    """清空当前页面的生成结果，开启一个新的前端会话。"""
+    """清空当前页面的生成结果，开启一个新的前端会话。
+
+    Streamlit 规则：同一轮脚本运行中，带 key 的输入组件一旦实例化，
+    就不能再直接写 st.session_state[组件 key]。
+    因此这里不再写 user_problem，而是通过更换输入框 key 的方式安全清空输入。
+    """
     for key in [
         "visualization_data",
         "pdf_path",
@@ -156,12 +162,17 @@ def reset_visual_state(clear_input: bool = False) -> None:
         "generation_error",
         "generation_started_at",
         "realtime_process_markdown",
+        "realtime_log_items",
+        "generation_log_queue",
     ]:
         if key in st.session_state:
             del st.session_state[key]
     st.session_state["active_session_id"] = str(uuid.uuid4())
     if clear_input:
-        st.session_state["user_problem"] = ""
+        # 不直接修改 text_area 当前 key 的值，避免 StreamlitAPIException。
+        # 改用新的 widget key，下一轮 rerun 时输入框自然变成空白。
+        st.session_state["problem_input_nonce"] = str(uuid.uuid4())
+        st.session_state["problem_initial_text"] = ""
 
 
 def cancel_current_generation(clear_input: bool = False) -> None:
@@ -187,10 +198,14 @@ def generate_visualization_job(
     include_detailed_report: bool,
     session_id: str,
     generation_id: str,
+    log_queue: Optional[Queue] = None,
 ) -> Dict[str, Any]:
     """后台任务：不直接调用任何 st.* 渲染函数。"""
     client = create_client(api_key, base_url)
-    realtime_process = build_local_process_log(user_problem, max_frames)
+    log_event(log_queue, "🟢 智能体会话启动：已接收题目，准备进入算法可视化流程。")
+    log_event(log_queue, "🔎 正在识别题型、抽取输入数据和约束条件。")
+    log_event(log_queue, "🧭 " + build_algorithm_policy(user_problem))
+    log_event(log_queue, f"🎞️ 正在规划逐帧展示，每种算法最多 {max_frames} 帧。")
     data = ask_llm_for_visualization(
         client=client,
         model=model,
@@ -198,8 +213,10 @@ def generate_visualization_job(
         max_frames=max_frames,
         fast_mode=fast_mode,
         include_detailed_report=include_detailed_report,
+        log_queue=log_queue,
     )
-    data["realtime_process_markdown"] = realtime_process
+    log_event(log_queue, "✅ 结构化可视化内容已完成：算法识别、帧数据、变量变化和报告摘要均已就绪。")
+    data["realtime_process_markdown"] = ""
     data["_session_id"] = session_id
     data["_generation_id"] = generation_id
     return data
@@ -278,6 +295,49 @@ def build_local_process_log(user_problem: str, max_frames: int) -> str:
 🚀 **当前执行**：正在生成 {algo_text} 的可视化帧、变量表和简洁教学报告。
 """.strip()
 
+
+
+
+def log_event(log_queue: Optional[Queue], message: str) -> None:
+    """把后台任务的公开过程写入队列，供页面实时打印。
+
+    这里记录的是可展示的智能体工作日志，不是模型隐藏思维链。
+    """
+    if log_queue is None:
+        return
+    try:
+        log_queue.put(f"{datetime.now().strftime('%H:%M:%S')}  {message}")
+    except Exception:
+        pass
+
+
+def drain_generation_log_queue() -> None:
+    """从后台队列取出实时日志，追加到 session_state。"""
+    q = st.session_state.get("generation_log_queue")
+    if q is None:
+        return
+    items = st.session_state.setdefault("realtime_log_items", [])
+    try:
+        while True:
+            items.append(q.get_nowait())
+    except Empty:
+        pass
+
+
+def build_log_markdown(items: List[str]) -> str:
+    return "\n\n".join(str(x).strip() for x in items if str(x).strip())
+
+
+def render_realtime_thinking(running: bool = False) -> None:
+    """页面打印实时思考过程。"""
+    items = st.session_state.get("realtime_log_items", [])
+    if not items:
+        st.info("等待智能体开始输出实时思考过程。")
+        return
+    text = "\n".join(items)
+    if running:
+        text += "\n▌"
+    st.code(text, language="text")
 
 def ensure_report(data: Dict[str, Any], user_problem: str) -> None:
     """如果智能体引擎没有给出教学报告，则用结构化结果本地整理一份短报告，避免再次请求智能体引擎。"""
@@ -389,6 +449,7 @@ def ask_llm_for_visualization(
     max_frames: int,
     fast_mode: bool = True,
     include_detailed_report: bool = False,
+    log_queue: Optional[Queue] = None,
 ) -> Dict[str, Any]:
     """一次生成结构化结果。快速模式下压缩算法数量、帧数和报告长度。"""
     system_prompt = load_system_prompt()
@@ -426,15 +487,50 @@ def ask_llm_for_visualization(
         temperature=0.1,
         max_tokens=3600 if fast_mode and not include_detailed_report else 7000,
     )
-    # 为了速度，默认不额外尝试 response_format；某些兼容接口不支持该参数，失败后重试会更慢。
-    response = client.chat.completions.create(**kwargs)
+    # 使用流式接收：页面可以实时打印公开工作过程，同时仍然只做一次主生成调用。
+    log_event(log_queue, "🧠 正在组织算法识别、状态变化、逐帧可视化和报告内容。")
+    content = ""
+    milestones = {
+        "task_title": "🏷️ 已生成题目标题与任务概括。",
+        "detected_problem_type": "🔍 已识别问题类型。",
+        "algorithms": "🧩 正在生成算法模块。",
+        "frames": "🎞️ 正在生成逐帧可视化内容。",
+        "variables": "📌 正在整理关键变量变化。",
+        "teaching_report_markdown": "📄 正在整理教学报告内容。",
+    }
+    emitted = set()
+    last_report_len = 0
+    try:
+        stream = client.chat.completions.create(**kwargs, stream=True)
+        for chunk in stream:
+            try:
+                delta = chunk.choices[0].delta.content or ""
+            except Exception:
+                delta = ""
+            if not delta:
+                continue
+            content += delta
+            for key, msg in milestones.items():
+                if key not in emitted and f'"{key}"' in content:
+                    emitted.add(key)
+                    log_event(log_queue, msg)
+            if len(content) - last_report_len >= 900:
+                last_report_len = len(content)
+                log_event(log_queue, f"📥 正在接收可视化数据，已接收约 {len(content)} 个字符。")
+    except Exception as stream_exc:
+        # 少数 OpenAI 兼容服务可能不支持流式输出；退回普通生成，保证程序可运行。
+        log_event(log_queue, "⚠️ 流式接收不可用，已切换为普通接收模式。")
+        response = client.chat.completions.create(**kwargs)
+        content = response.choices[0].message.content or ""
 
-    content = response.choices[0].message.content or ""
+    log_event(log_queue, "🧪 正在解析结构化结果并检查字段完整性。")
     try:
         data = extract_json_object(content)
     except Exception as exc:
+        log_event(log_queue, "❌ 结构化结果解析失败，页面将显示错误信息。")
         raise ValueError(content) from exc
     ensure_report(data, user_problem)
+    log_event(log_queue, "🧾 正在补全报告摘要并准备页面渲染。")
     return data
 
 
@@ -627,8 +723,8 @@ def make_pdf(data: Dict[str, Any]) -> str:
 
     realtime_process = data.get("realtime_process_markdown", "")
     if realtime_process:
-        story.append(Paragraph("一、智能体工作流记录", styles["ChineseHeading"]))
-        story.append(Paragraph("说明：以下内容是页面端展示的智能体公开工作流，用于呈现题目理解、算法选择、可视化规划和报告整理过程。", styles["ChineseBody"]))
+        story.append(Paragraph("一、实时思考过程记录", styles["ChineseHeading"]))
+        story.append(Paragraph("说明：以下内容是页面端实时打印的智能体公开思考过程，用于呈现题目理解、算法选择、可视化规划、变量整理和报告输出过程。", styles["ChineseBody"]))
         for para in str(realtime_process).split("\n"):
             line = para.strip()
             if not line:
@@ -784,12 +880,19 @@ def main() -> None:
 
         st.markdown("---")
         st.info("默认只启动一次智能体生成流程；后台执行，页面可随时终止并切换新会话。")
+        st.info("生成时会实时打印公开思考过程：题型识别、算法范围、帧生成、变量整理和报告输出。")
         st.info("若点击终止，旧生成结果会被自动丢弃，不会覆盖新会话。")
 
     sample = "请可视化求解 01 背包问题。背包容量 15，物品 A 重量2 价值6，B 重量3 价值10，C 重量4 价值12，D 重量5 价值14，E 重量9 价值20，F 重量7 价值18。请用动态规划。"
-    if "user_problem" not in st.session_state:
-        st.session_state["user_problem"] = sample
-    user_problem = st.text_area("请输入算法题目", key="user_problem", height=160)
+
+    # 输入框使用动态 key。这样点击“终止并新建 / 开启新会话”时，
+    # 只需要切换 key，不需要在组件实例化后强行改它的 session_state。
+    if "problem_input_nonce" not in st.session_state:
+        st.session_state["problem_input_nonce"] = "default"
+    problem_key = f"user_problem_{st.session_state['problem_input_nonce']}"
+    if problem_key not in st.session_state:
+        st.session_state[problem_key] = st.session_state.pop("problem_initial_text", sample)
+    user_problem = st.text_area("请输入算法题目", key=problem_key, height=160)
 
     col1, col2, col3 = st.columns([1.1, 1.1, 2.8])
     with col1:
@@ -823,7 +926,10 @@ def main() -> None:
         st.session_state["active_session_id"] = session_id
         generation_id = str(uuid.uuid4())
         realtime_process = build_local_process_log(user_problem, max_frames)
+        initial_log_items = [line.strip() for line in realtime_process.splitlines() if line.strip()]
         st.session_state["realtime_process_markdown"] = realtime_process
+        st.session_state["realtime_log_items"] = initial_log_items
+        st.session_state["generation_log_queue"] = Queue()
         st.session_state["generation_id"] = generation_id
         st.session_state["generation_started_at"] = time.time()
 
@@ -839,6 +945,7 @@ def main() -> None:
             include_detailed_report=include_detailed_report,
             session_id=session_id,
             generation_id=generation_id,
+            log_queue=st.session_state["generation_log_queue"],
         )
         st.session_state["generation_future"] = future
         st.rerun()
@@ -846,9 +953,9 @@ def main() -> None:
     # 后台任务轮询区：页面不会卡死，用户可以点“终止当前生成 / 开启新会话”。
     future = st.session_state.get("generation_future")
     if isinstance(future, Future):
-        st.markdown("## 智能体工作流")
-        st.caption("这里展示可公开的工作流：题目理解、算法范围、可视化帧规划和报告整理。")
-        st.markdown(st.session_state.get("realtime_process_markdown", ""))
+        drain_generation_log_queue()
+        st.markdown("## 实时思考过程")
+        st.caption("这里打印的是算法可视化智能体的公开思考过程，用于教学展示；不是隐藏推理链。")
 
         current_generation_id = st.session_state.get("generation_id")
         current_session_id = st.session_state.get("active_session_id")
@@ -856,17 +963,25 @@ def main() -> None:
         if future.done():
             try:
                 data = future.result()
+                drain_generation_log_queue()
                 # 关键：旧会话/旧任务完成后不允许覆盖新页面。
                 if data.get("_generation_id") == current_generation_id and data.get("_session_id") == current_session_id:
                     data.pop("_generation_id", None)
                     data.pop("_session_id", None)
+                    realtime_log = build_log_markdown(st.session_state.get("realtime_log_items", []))
+                    data["realtime_process_markdown"] = realtime_log
+                    st.session_state["realtime_process_markdown"] = realtime_log
                     st.session_state["visualization_data"] = data
                     del st.session_state["generation_future"]
+                    render_realtime_thinking(running=False)
                     st.success("算法可视化内容已生成，并将自动整理为 PDF 报告。")
                 else:
                     del st.session_state["generation_future"]
+                    render_realtime_thinking(running=False)
                     st.info("一个旧任务已经完成，但它属于已终止会话，结果已自动丢弃。")
             except Exception as e:
+                drain_generation_log_queue()
+                render_realtime_thinking(running=False)
                 if "generation_future" in st.session_state:
                     del st.session_state["generation_future"]
                 if is_quota_or_permission_error(e):
@@ -877,6 +992,7 @@ def main() -> None:
                 return
         else:
             elapsed = int(time.time() - float(st.session_state.get("generation_started_at", time.time())))
+            render_realtime_thinking(running=True)
             st.info(f"智能体正在生成算法可视化内容……已等待 {elapsed} 秒。点击侧栏“终止当前生成”可立即开启新会话。")
             st.progress(min(95, 15 + (elapsed * 5) % 80))
             time.sleep(0.8)
@@ -887,7 +1003,7 @@ def main() -> None:
         return
 
     if data.get("realtime_process_markdown"):
-        with st.expander("查看完整智能体工作流", expanded=False):
+        with st.expander("查看完整实时思考过程", expanded=False):
             st.markdown(data.get("realtime_process_markdown", ""))
 
     st.markdown("## 智能体识别结果")
