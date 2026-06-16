@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-算法过程可视化 - LLM版
+算法可视化智能体 - 加速版
 
 设计原则：
 1. 不在本地实现回溯、动态规划、分支限界、遗传算法、模拟退火等求解器。
-2. 算法识别、求解步骤、可视化帧、教学讲解、报告内容全部由 OpenAI 兼容接口的大模型生成。
-3. 本地程序只做三件事：调用大模型 API、渲染大模型返回的可视化 JSON、导出 PDF。
+2. 算法识别、求解步骤、可视化帧、教学讲解、报告内容全部由智能体引擎生成。
+3. 本地程序只做三件事：连接智能体引擎、渲染结构化可视化结果、导出 PDF。
 """
 
 import os
@@ -13,6 +13,9 @@ import re
 import json
 import html
 import tempfile
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -30,23 +33,23 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 
 
-APP_TITLE = "算法过程可视化"
-# 使用通用 OpenAI 兼容接口配置。硅基流动只需替换 endpoint 即可。
+APP_TITLE = "算法可视化智能体"
+# 使用通用 智能体引擎配置。硅基流动只需替换 endpoint 即可。
 DEFAULT_BASE_URL = "https://api.siliconflow.cn/v1"
 DEFAULT_MODEL = "nex-agi/Nex-N2-Pro"
 
 DEFAULT_SYSTEM_PROMPT = r"""
-你是“算法过程可视化”智能体。你的核心任务不是只给答案，而是把算法求解过程转换为可逐帧展示的可视化数据。
+你是“算法可视化智能体”。你的任务是把用户输入的算法题，快速转成可渲染的结构化数据。
 
-重要约束：
-- 你必须根据用户输入自动识别问题类型和适合的算法，不能要求用户从固定列表中选择。
-- 算法步骤、状态变化、可视化帧、最终报告文字都由你生成。
-- 不要假设本地程序会替你运行算法；你必须自己推导并给出过程。
-- 对小规模实例要尽量精确计算；不确定时要写明“近似演示”或“启发式结果”。
-- 回溯法、动态规划、分支限界通常应给出精确最优解；遗传算法、模拟退火属于启发式方法，可以展示迭代过程，并说明不保证每次最优。
-- 输出必须是严格 JSON，不要输出 Markdown 代码块，不要在 JSON 前后添加解释。
+硬性要求：
+- 只处理用户明确指定的算法；用户没有指定算法时，只选择 1 个最适合教学展示的算法。
+- 不要擅自扩展成动态规划、回溯、分支限界、遗传算法、模拟退火等一大堆算法。
+- 底层输出必须是严格 JSON，不要 Markdown 代码块，不要 JSON 外解释。
+- 可视化帧必须短小、清晰、能直接渲染。
+- Mermaid 只用简单 flowchart TD 或 graph TD；table 第一行必须是表头。
+- 报告默认写简洁版，不要写长篇论文式报告。
 
-你需要输出如下 JSON 结构：
+必须输出如下 JSON：
 {
   "task_title": "题目标题",
   "detected_problem_type": "自动识别的问题类型",
@@ -58,18 +61,18 @@ DEFAULT_SYSTEM_PROMPT = r"""
       "role": "该算法为什么适合该问题",
       "guarantee": "是否保证最优以及原因",
       "core_idea": "核心思想",
-      "complexity": "时间和空间复杂度，允许用常见表达式",
+      "complexity": "时间和空间复杂度",
       "final_answer": "该算法得到的结果",
       "frames": [
         {
           "step": 1,
           "title": "当前帧标题",
           "explanation": "这一帧解释什么算法动作",
-          "state": "关键状态，例如当前物品、容量、队列、温度、种群等",
+          "state": "关键状态",
           "visual_type": "mermaid|table|array|text",
-          "mermaid": "若 visual_type 为 mermaid，则给 Mermaid 图代码；可为空字符串",
+          "mermaid": "",
           "table": [["列1", "列2"], ["值1", "值2"]],
-          "array": ["若 visual_type 为 array，则给数组或染色体展示"],
+          "array": [],
           "variables": {"变量名": "变量值"},
           "pseudocode_focus": "本帧对应的伪代码关键句"
         }
@@ -80,30 +83,22 @@ DEFAULT_SYSTEM_PROMPT = r"""
   "comparison": [
     {"algorithm": "算法名", "view": "主要看什么图", "strength": "优点", "limitation": "局限"}
   ],
-  "teaching_report_markdown": "完整教学报告，必须足够详细，包含题目解析、输入数据、算法选择理由、逐算法求解过程、关键帧说明、结果对比、复杂度分析、学习总结和可核验结论"
+  "teaching_report_markdown": "简洁教学报告"
 }
-
-可视化帧生成规则：
-1. 每个算法建议 4-8 帧，保证录屏时清晰。
-2. 如果是回溯/分支限界，优先使用 Mermaid flowchart 展示决策树、剪枝、队列、上界。
-3. 如果是动态规划，优先使用 table 展示状态转移表，并在 explanation 中说明 dp 状态含义。
-4. 如果是遗传算法，优先使用 table/array 展示染色体、适应度、选择、交叉、变异、最优个体变化。
-5. 如果是模拟退火，优先使用 table/array 展示当前解、邻域解、温度、接受概率、历史最优。
-6. Mermaid 代码要简洁，尽量使用 flowchart TD 或 graph TD，不要使用过复杂语法。
-7. table 的第一行必须是表头。
-8. teaching_report_markdown 必须是一份可以直接写入 PDF 的详细文档，不少于 1200 字；如果题目很小，也要解释每种算法的核心思想、每一步如何变化、最终结果如何验证。
-9. 所有内容使用中文。
 """
 
 
 def load_system_prompt() -> str:
-    local_file = os.path.join(os.path.dirname(__file__), "AGENT_PROMPT.md")
-    if os.path.exists(local_file):
-        try:
-            with open(local_file, "r", encoding="utf-8") as f:
-                return f.read()
-        except Exception:
-            return DEFAULT_SYSTEM_PROMPT
+    # 加速版默认使用内置短提示词，避免外部 AGENT_PROMPT.md 仍然保留旧版超长提示词导致变慢。
+    # 如确实需要外部提示词，可设置环境变量 USE_LOCAL_AGENT_PROMPT=1。
+    if os.environ.get("USE_LOCAL_AGENT_PROMPT") == "1":
+        local_file = os.path.join(os.path.dirname(__file__), "AGENT_PROMPT.md")
+        if os.path.exists(local_file):
+            try:
+                with open(local_file, "r", encoding="utf-8") as f:
+                    return f.read()
+            except Exception:
+                pass
     return DEFAULT_SYSTEM_PROMPT
 
 
@@ -118,7 +113,7 @@ def get_secret(name: str, default: str = "") -> str:
 
 
 def get_config(names: List[str], default: str = "") -> str:
-    """按顺序读取配置，优先使用通用 OPENAI_*，兼容旧版 SILICONFLOW_*。"""
+    """按顺序读取配置，优先使用通用环境变量，兼容旧版服务配置。"""
     for name in names:
         value = get_secret(name, "")
         if value:
@@ -136,13 +131,84 @@ def is_quota_or_permission_error(err: Exception) -> bool:
 
 
 def create_client(api_key: str, base_url: str) -> OpenAI:
-    return OpenAI(api_key=api_key, base_url=base_url)
+    # 设置超时，避免接口卡住导致页面一直等待。
+    return OpenAI(api_key=api_key, base_url=base_url, timeout=60)
+
+
+@st.cache_resource
+def get_executor() -> ThreadPoolExecutor:
+    """后台线程池。
+
+    作用：把智能体生成请求放到后台执行，主页面保持可刷新，用户可以点击
+    “终止当前生成 / 开启新会话”。已发出的生成请求不一定能被服务端强制取消，
+    但旧任务完成后会被 generation_id 丢弃，不会覆盖新会话。
+    """
+    return ThreadPoolExecutor(max_workers=4)
+
+
+def reset_visual_state(clear_input: bool = False) -> None:
+    """清空当前页面的生成结果，开启一个新的前端会话。"""
+    for key in [
+        "visualization_data",
+        "pdf_path",
+        "generation_future",
+        "generation_id",
+        "generation_error",
+        "generation_started_at",
+        "realtime_process_markdown",
+    ]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.session_state["active_session_id"] = str(uuid.uuid4())
+    if clear_input:
+        st.session_state["user_problem"] = ""
+
+
+def cancel_current_generation(clear_input: bool = False) -> None:
+    """终止当前页面等待，并开启新会话。
+
+    注意：已经发出去的生成请求通常无法可靠强杀；
+    这里通过切换 active_session_id 和 generation_id，让旧任务的返回结果自动作废。
+    """
+    old_future = st.session_state.get("generation_future")
+    if isinstance(old_future, Future) and not old_future.done():
+        old_future.cancel()
+    reset_visual_state(clear_input=clear_input)
+
+
+def generate_visualization_job(
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    user_problem: str,
+    max_frames: int,
+    fast_mode: bool,
+    include_detailed_report: bool,
+    session_id: str,
+    generation_id: str,
+) -> Dict[str, Any]:
+    """后台任务：不直接调用任何 st.* 渲染函数。"""
+    client = create_client(api_key, base_url)
+    realtime_process = build_local_process_log(user_problem, max_frames)
+    data = ask_llm_for_visualization(
+        client=client,
+        model=model,
+        user_problem=user_problem,
+        max_frames=max_frames,
+        fast_mode=fast_mode,
+        include_detailed_report=include_detailed_report,
+    )
+    data["realtime_process_markdown"] = realtime_process
+    data["_session_id"] = session_id
+    data["_generation_id"] = generation_id
+    return data
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
-    """从模型输出中提取 JSON。若模型误加代码块，也尽量恢复。"""
+    """从智能体结构化输出中提取数据。若输出误加代码块，也尽量恢复。"""
     if not text:
-        raise ValueError("模型没有返回内容")
+        raise ValueError("智能体引擎没有返回内容")
 
     cleaned = text.strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -158,16 +224,105 @@ def extract_json_object(text: str) -> Dict[str, Any]:
         raise
 
 
+ALGORITHM_KEYWORDS = [
+    ("动态规划", ["动态规划", "dp", "DP"]),
+    ("回溯法", ["回溯", "回溯法", "backtracking"]),
+    ("分支限界", ["分支限界", "分枝限界", "branch and bound", "branch-and-bound"]),
+    ("贪心算法", ["贪心", "greedy"]),
+    ("分治法", ["分治", "divide and conquer"]),
+    ("广度优先搜索", ["广度优先", "BFS", "bfs"]),
+    ("深度优先搜索", ["深度优先", "DFS", "dfs"]),
+    ("Dijkstra 算法", ["dijkstra", "Dijkstra", "迪ijkstra", "最短路径"]),
+    ("遗传算法", ["遗传算法", "GA", "genetic"]),
+    ("模拟退火", ["模拟退火", "SA", "annealing"]),
+    ("快速排序", ["快速排序", "快排", "quick sort", "quicksort"]),
+    ("归并排序", ["归并排序", "merge sort", "mergesort"]),
+]
+
+
+def detect_requested_algorithms(user_problem: str) -> List[str]:
+    """识别用户文本里明确点名的算法。点名几个就只处理几个；未点名则返回空列表。"""
+    found: List[str] = []
+    text = user_problem or ""
+    lower_text = text.lower()
+    for canonical, keys in ALGORITHM_KEYWORDS:
+        for key in keys:
+            if key.lower() in lower_text:
+                found.append(canonical)
+                break
+    # 去重并保持顺序
+    result: List[str] = []
+    for name in found:
+        if name not in result:
+            result.append(name)
+    return result
+
+
+def build_algorithm_policy(user_problem: str) -> str:
+    requested = detect_requested_algorithms(user_problem)
+    if requested:
+        return "用户已明确指定算法，只允许输出这些算法：" + "、".join(requested) + "。不要额外生成其他算法。"
+    return "用户没有明确指定算法，只选择 1 个最适合本题的算法，不要扩展生成多个算法。"
+
+
+def build_local_process_log(user_problem: str, max_frames: int) -> str:
+    """本地即时生成公开过程，不再为“实时日志”额外启动一次智能体生成流程。"""
+    policy = build_algorithm_policy(user_problem)
+    requested = detect_requested_algorithms(user_problem)
+    algo_text = "、".join(requested) if requested else "自动选择 1 个最适合算法"
+    return f"""
+✅ **题目已接收**：系统将输入题目整理为算法可视化任务。  
+🔎 **算法范围**：{policy}  
+📊 **逐帧可视化**：每种算法最多生成 {max_frames} 帧，优先展示关键状态、变量变化和表格/流程图。  
+📄 **报告策略**：快速模式下不再先生成长篇实时日志，直接生成可视化内容，并由页面立即渲染；PDF 会根据智能体输出自动整理。  
+🚀 **当前执行**：正在生成 {algo_text} 的可视化帧、变量表和简洁教学报告。
+""".strip()
+
+
+def ensure_report(data: Dict[str, Any], user_problem: str) -> None:
+    """如果智能体引擎没有给出教学报告，则用结构化结果本地整理一份短报告，避免再次请求智能体引擎。"""
+    if str(data.get("teaching_report_markdown", "")).strip():
+        return
+    algorithms = data.get("algorithms", []) or []
+    lines = [
+        "# 算法可视化智能体教学报告",
+        "",
+        "## 题目概括",
+        str(data.get("input_summary", user_problem)),
+        "",
+        "## 问题类型与目标",
+        f"识别类型：{data.get('detected_problem_type', '未识别')}。学习目标：{data.get('overall_goal', '理解算法状态变化与最终结果。')}",
+        "",
+        "## 算法过程",
+    ]
+    for alg in algorithms:
+        lines.extend([
+            f"### {alg.get('name', '算法')}",
+            f"核心思想：{alg.get('core_idea', '')}",
+            f"结果保证：{alg.get('guarantee', '')}",
+            f"复杂度：{alg.get('complexity', '')}",
+            f"最终结果：{alg.get('final_answer', '')}",
+            "关键帧：",
+        ])
+        for fr in alg.get("frames", []) or []:
+            lines.append(f"- 帧 {fr.get('step', '')}：{fr.get('title', '')}。{fr.get('explanation', '')}")
+        lines.append(f"总结：{alg.get('summary', '')}")
+        lines.append("")
+    lines.extend([
+        "## 学习总结",
+        "本报告由结构化数据自动整理，重点保留算法识别、逐帧可视化、变量变化、伪代码焦点和最终结论，适合课堂演示与作业提交。",
+    ])
+    data["teaching_report_markdown"] = "\n".join(lines)
 
 
 def build_public_process_prompt(user_problem: str, max_frames: int) -> str:
     """生成可公开展示的“求解过程日志”提示词。
 
-    注意：这里不是要求模型暴露隐藏思维链，而是要求模型生成适合课堂展示和录屏的
+    注意：这里不是展示隐藏推理链，而是生成适合课堂展示和录屏的
     公开版工作日志：它描述智能体正在做什么、为什么这样做、接下来会输出什么。
     """
     return f"""
-请为下面的算法题生成“公开可展示的实时求解过程日志”。
+请为下面的算法题生成“公开可展示的智能体工作流日志”。
 
 重要要求：
 1. 这不是隐藏思维链，不要写私密心理活动；只输出可以展示给学生看的解题工作流。
@@ -197,7 +352,7 @@ def stream_public_process(
         stream = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "你是算法过程可视化智能体。请输出公开可展示的求解过程日志，不要输出隐藏思维链。"},
+                {"role": "system", "content": "你是算法可视化智能体。请输出公开可展示的智能体工作流，不要输出隐藏推理链。"},
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
@@ -223,37 +378,64 @@ def stream_public_process(
             progress_bar.progress(100)
         return buffer.strip()
     except Exception as exc:
-        msg = "实时求解过程生成失败，将继续尝试生成结构化可视化结果。\n\n错误信息：" + str(exc)
+        msg = "智能体工作流生成失败，将继续尝试生成可视化结果。\n\n错误信息：" + str(exc)
         placeholder.warning(msg)
         return msg
 
-def ask_llm_for_visualization(client: OpenAI, model: str, user_problem: str, max_frames: int) -> Dict[str, Any]:
+def ask_llm_for_visualization(
+    client: OpenAI,
+    model: str,
+    user_problem: str,
+    max_frames: int,
+    fast_mode: bool = True,
+    include_detailed_report: bool = False,
+) -> Dict[str, Any]:
+    """一次生成结构化结果。快速模式下压缩算法数量、帧数和报告长度。"""
     system_prompt = load_system_prompt()
+    algorithm_policy = build_algorithm_policy(user_problem)
+    report_requirement = (
+        "teaching_report_markdown 写 1000-1400 字的详细报告。"
+        if include_detailed_report else
+        "teaching_report_markdown 写 300-600 字简洁报告；不要长篇铺垫。"
+    )
+    frame_rule = (
+        f"每种算法最多 {max_frames} 帧，每帧解释不超过 80 字。"
+        if fast_mode else
+        f"每种算法最多 {max_frames} 帧。"
+    )
     user_prompt = f"""
-请将下面的算法题目转化为可视化求解过程。要求：
-1. 自动识别问题类型，不要依赖用户从菜单选择。
-2. 由你生成算法过程、可视化帧和教学报告。
-3. 若用户要求多种算法，请分别生成；若用户没有指定算法，请选择最适合教学展示的 1-3 种算法。
-4. 每种算法最多生成 {max_frames} 帧。
-5. teaching_report_markdown 必须是详细 PDF 报告正文，包含完整求解过程，不少于 1200 字。
-6. 严格按照系统提示词给出的 JSON 结构输出。
+请快速将下面题目转化为可视化结构化数据。
+
+加速规则：
+1. {algorithm_policy}
+2. {frame_rule}
+3. 每个 frame 的 table 不超过 8 行；Mermaid 节点不超过 12 个。
+4. variables 只保留最关键 3-6 个变量。
+5. {report_requirement}
+6. 只输出严格 JSON，不要输出 Markdown 代码块，不要解释。
 
 用户题目：
 {user_problem}
 """
-    response = client.chat.completions.create(
+    kwargs = dict(
         model=model,
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        temperature=0.2,
+        temperature=0.1,
+        max_tokens=3600 if fast_mode and not include_detailed_report else 7000,
     )
+    # 为了速度，默认不额外尝试 response_format；某些兼容接口不支持该参数，失败后重试会更慢。
+    response = client.chat.completions.create(**kwargs)
+
     content = response.choices[0].message.content or ""
     try:
-        return extract_json_object(content)
+        data = extract_json_object(content)
     except Exception as exc:
         raise ValueError(content) from exc
+    ensure_report(data, user_problem)
+    return data
 
 
 def repair_json_with_llm(client: OpenAI, model: str, bad_text: str) -> Dict[str, Any]:
@@ -369,7 +551,7 @@ def _pdf_table_from_rows(rows: List[List[Any]], col_widths: List[float], font_si
 def make_pdf(data: Dict[str, Any]) -> str:
     """生成详细 PDF。
 
-    注意：算法求解内容来自大模型返回的 JSON；本函数只负责将智能体输出排版成 PDF，
+    注意：算法求解内容来自智能体返回的结构化数据；本函数只负责将智能体输出排版成 PDF，
     不参与算法求解、不实现本地算法求解器。
     """
     pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
@@ -437,16 +619,16 @@ def make_pdf(data: Dict[str, Any]) -> str:
     )
 
     story: List[Any] = []
-    story.append(Paragraph("算法过程可视化", styles["ChineseTitle"]))
-    story.append(Paragraph("智能体自动生成的详细求解过程 PDF", styles["ChineseHeading"]))
+    story.append(Paragraph("算法可视化智能体", styles["ChineseTitle"]))
+    story.append(Paragraph("算法可视化智能体生成的详细求解报告", styles["ChineseHeading"]))
     story.append(Paragraph("生成时间：" + datetime.now().strftime("%Y-%m-%d %H:%M:%S"), styles["ChineseBody"]))
-    story.append(Paragraph("说明：本 PDF 的题目识别、算法步骤、可视化帧、变量变化和教学报告来自 OpenAI 兼容接口的大模型输出；程序仅负责把大模型输出排版为 PDF。", styles["ChineseBody"]))
+    story.append(Paragraph("说明：本报告的题目识别、算法步骤、可视化帧、变量变化和教学内容来自算法可视化智能体输出；程序负责将智能体输出整理为 PDF。", styles["ChineseBody"]))
     story.append(Spacer(1, 0.2 * cm))
 
     realtime_process = data.get("realtime_process_markdown", "")
     if realtime_process:
-        story.append(Paragraph("一、智能体实时求解过程记录", styles["ChineseHeading"]))
-        story.append(Paragraph("说明：以下内容是智能体在网页端实时流式输出的公开求解日志，用于展示题目理解、算法选择、可视化规划和报告生成过程。", styles["ChineseBody"]))
+        story.append(Paragraph("一、智能体工作流记录", styles["ChineseHeading"]))
+        story.append(Paragraph("说明：以下内容是页面端展示的智能体公开工作流，用于呈现题目理解、算法选择、可视化规划和报告整理过程。", styles["ChineseBody"]))
         for para in str(realtime_process).split("\n"):
             line = para.strip()
             if not line:
@@ -512,7 +694,7 @@ def make_pdf(data: Dict[str, Any]) -> str:
                     detail_rows.append(["可视化类型", visual_type])
                     story.append(_pdf_table_from_rows(detail_rows, [3.0 * cm, 13.0 * cm], 8.2))
 
-                    # 将模型返回的可视化数据也写入 PDF，便于审核者看到“智能体求解过程”。
+                    # 将智能体返回的可视化数据也写入 PDF，便于审核者看到“智能体求解过程”。
                     if visual_type == "table" and fr.get("table"):
                         raw_table = fr.get("table", [])
                         try:
@@ -550,7 +732,7 @@ def make_pdf(data: Dict[str, Any]) -> str:
     report = data.get("teaching_report_markdown", "")
     if report:
         story.append(PageBreak())
-        story.append(Paragraph("大模型生成的完整教学报告", styles["ChineseHeading"]))
+        story.append(Paragraph("智能体生成的完整教学报告", styles["ChineseHeading"]))
         for para in str(report).split("\n"):
             line = para.strip()
             if not line:
@@ -571,91 +753,144 @@ def make_pdf(data: Dict[str, Any]) -> str:
 def main() -> None:
     st.set_page_config(page_title=APP_TITLE, layout="wide")
     st.title(APP_TITLE)
-    st.caption("基于 OpenAI 兼容接口的大模型算法过程可视化：输入题目，大模型生成算法识别、求解过程、可视化帧和 PDF 报告。")
+    st.caption("输入算法题目后，智能体自动识别问题、生成逐帧可视化、变量变化和教学报告；支持随时终止并开启新会话。")
+
+    if "active_session_id" not in st.session_state:
+        st.session_state["active_session_id"] = str(uuid.uuid4())
+
+    running_future = st.session_state.get("generation_future")
+    is_running = isinstance(running_future, Future) and not running_future.done()
 
     with st.sidebar:
-        st.header("OpenAI 兼容接口配置")
-        api_key = st.text_input("OPENAI_API_KEY", value=get_config(["OPENAI_API_KEY", "SILICONFLOW_API_KEY"], ""), type="password")
-        base_url = st.text_input("OPENAI_BASE_URL", value=get_config(["OPENAI_BASE_URL", "SILICONFLOW_BASE_URL"], DEFAULT_BASE_URL))
-        model = st.text_input("OPENAI_MODEL", value=get_config(["OPENAI_MODEL", "SILICONFLOW_MODEL"], DEFAULT_MODEL))
-        max_frames = st.slider("每种算法最多帧数", min_value=3, max_value=10, value=5)
+        st.header("智能体引擎配置")
+        api_key = st.text_input("智能体接口密钥", value=get_config(["OPENAI_API_KEY", "SILICONFLOW_API_KEY"], ""), type="password")
+        base_url = st.text_input("服务地址", value=get_config(["OPENAI_BASE_URL", "SILICONFLOW_BASE_URL"], DEFAULT_BASE_URL))
+        model = st.text_input("推理引擎", value=get_config(["OPENAI_MODEL", "SILICONFLOW_MODEL"], DEFAULT_MODEL))
+        fast_mode = st.checkbox("快速模式：少算法、少帧、短报告", value=True)
+        include_detailed_report = st.checkbox("生成长篇教学报告（较慢）", value=False)
+        default_frames = 3 if fast_mode else 5
+        max_frame_upper = 5 if fast_mode else 10
+        max_frames = st.slider("每种算法最多帧数", min_value=2, max_value=max_frame_upper, value=default_frames)
+
         st.markdown("---")
-        st.info("默认使用硅基流动 OpenAI 兼容接口：base_url=https://api.siliconflow.cn/v1，模型 nex-agi/Nex-N2-Pro。")
-        st.info("本项目不在本地实现算法求解器；本地只负责调用大模型、渲染可视化和导出 PDF。")
+        st.subheader("会话控制")
+        if st.button("终止当前生成", use_container_width=True, disabled=not is_running):
+            cancel_current_generation(clear_input=False)
+            st.success("已终止当前生成；旧结果若稍后返回，也不会覆盖新会话。")
+            st.rerun()
+        if st.button("开启新会话", use_container_width=True):
+            cancel_current_generation(clear_input=True)
+            st.rerun()
 
-    sample = "请可视化求解 01 背包问题。背包容量 15，物品 A 重量2 价值6，B 重量3 价值10，C 重量4 价值12，D 重量5 价值14，E 重量9 价值20，F 重量7 价值18。请用回溯法、动态规划、分支限界、遗传算法、模拟退火进行对比。"
-    user_problem = st.text_area("请输入算法题目", value=sample, height=160)
+        st.markdown("---")
+        st.info("默认只启动一次智能体生成流程；后台执行，页面可随时终止并切换新会话。")
+        st.info("若点击终止，旧生成结果会被自动丢弃，不会覆盖新会话。")
 
-    col1, col2 = st.columns([1, 3])
+    sample = "请可视化求解 01 背包问题。背包容量 15，物品 A 重量2 价值6，B 重量3 价值10，C 重量4 价值12，D 重量5 价值14，E 重量9 价值20，F 重量7 价值18。请用动态规划。"
+    if "user_problem" not in st.session_state:
+        st.session_state["user_problem"] = sample
+    user_problem = st.text_area("请输入算法题目", key="user_problem", height=160)
+
+    col1, col2, col3 = st.columns([1.1, 1.1, 2.8])
     with col1:
-        run = st.button("生成算法过程可视化", type="primary", use_container_width=True)
+        run = st.button("启动算法可视化智能体", type="primary", use_container_width=True, disabled=is_running)
     with col2:
-        st.write("支持自然语言输入，例如：01 背包、N 皇后、最短路径、排序、LCS、TSP、图搜索等。")
+        stop_and_new = st.button("终止并新建", use_container_width=True, disabled=not is_running)
+    with col3:
+        if is_running:
+            st.warning("当前正在生成。你可以点击“终止并新建”立即切换到新会话。")
+        else:
+            st.write("若题目写明算法名，系统只处理该算法；未写明则自动选择 1 个算法。")
+
+    if stop_and_new:
+        cancel_current_generation(clear_input=True)
+        st.rerun()
 
     if run:
         if not api_key:
-            st.error("请先配置 OPENAI_API_KEY。")
+            st.error("请先配置智能体接口密钥。")
             return
         if not user_problem.strip():
             st.error("请输入算法题目。")
             return
 
-        client = create_client(api_key, base_url)
+        # 开始新一轮生成：清掉旧结果，但保留输入框内容。
+        for key in ["visualization_data", "pdf_path", "generation_error"]:
+            if key in st.session_state:
+                del st.session_state[key]
 
-        st.markdown("## 智能体实时求解过程")
-        st.caption("这里显示的是可公开展示的求解工作流，不是模型隐藏思维链；适合录屏展示智能体如何分析题目。")
-        realtime_placeholder = st.empty()
-        realtime_progress = st.progress(0)
-        realtime_process = stream_public_process(
-            client=client,
+        session_id = st.session_state.get("active_session_id") or str(uuid.uuid4())
+        st.session_state["active_session_id"] = session_id
+        generation_id = str(uuid.uuid4())
+        realtime_process = build_local_process_log(user_problem, max_frames)
+        st.session_state["realtime_process_markdown"] = realtime_process
+        st.session_state["generation_id"] = generation_id
+        st.session_state["generation_started_at"] = time.time()
+
+        executor = get_executor()
+        future = executor.submit(
+            generate_visualization_job,
+            api_key=api_key,
+            base_url=base_url,
             model=model,
             user_problem=user_problem,
             max_frames=max_frames,
-            placeholder=realtime_placeholder,
-            progress_bar=realtime_progress,
+            fast_mode=fast_mode,
+            include_detailed_report=include_detailed_report,
+            session_id=session_id,
+            generation_id=generation_id,
         )
+        st.session_state["generation_future"] = future
+        st.rerun()
 
-        with st.status("正在生成结构化可视化 JSON 和 PDF 报告正文……", expanded=True) as status:
-            st.write("1. 已完成公开版求解过程日志。")
-            st.write("2. 正在要求大模型输出严格 JSON：算法识别、逐帧可视化、变量变化、教学报告。")
+    # 后台任务轮询区：页面不会卡死，用户可以点“终止当前生成 / 开启新会话”。
+    future = st.session_state.get("generation_future")
+    if isinstance(future, Future):
+        st.markdown("## 智能体工作流")
+        st.caption("这里展示可公开的工作流：题目理解、算法范围、可视化帧规划和报告整理。")
+        st.markdown(st.session_state.get("realtime_process_markdown", ""))
+
+        current_generation_id = st.session_state.get("generation_id")
+        current_session_id = st.session_state.get("active_session_id")
+
+        if future.done():
             try:
-                data = ask_llm_for_visualization(client, model, user_problem, max_frames)
-                data["realtime_process_markdown"] = realtime_process
-                status.update(label="结构化结果生成完成", state="complete", expanded=False)
+                data = future.result()
+                # 关键：旧会话/旧任务完成后不允许覆盖新页面。
+                if data.get("_generation_id") == current_generation_id and data.get("_session_id") == current_session_id:
+                    data.pop("_generation_id", None)
+                    data.pop("_session_id", None)
+                    st.session_state["visualization_data"] = data
+                    del st.session_state["generation_future"]
+                    st.success("算法可视化内容已生成，并将自动整理为 PDF 报告。")
+                else:
+                    del st.session_state["generation_future"]
+                    st.info("一个旧任务已经完成，但它属于已终止会话，结果已自动丢弃。")
             except Exception as e:
+                if "generation_future" in st.session_state:
+                    del st.session_state["generation_future"]
                 if is_quota_or_permission_error(e):
-                    status.update(label="接口调用失败", state="error", expanded=True)
-                    st.error("接口调用失败：请检查 API Key、模型权限、账户额度，以及模型名是否可用。")
-                    st.code(str(e), language="text")
-                    return
-                st.warning("首次解析 JSON 失败，尝试让大模型修复输出格式。")
-                try:
-                    data = repair_json_with_llm(client, model, str(e))
-                    data["realtime_process_markdown"] = realtime_process
-                    status.update(label="JSON 修复完成", state="complete", expanded=False)
-                except Exception as e2:
-                    status.update(label="生成失败", state="error", expanded=True)
-                    if is_quota_or_permission_error(e2):
-                        st.error("接口调用失败：请检查 API Key、模型权限、账户额度，以及模型名是否可用。")
-                        st.code(str(e2), language="text")
-                        return
-                    st.error(f"生成失败：{e2}")
-                    return
-
-        st.session_state["visualization_data"] = data
-        if "pdf_path" in st.session_state:
-            del st.session_state["pdf_path"]
-        st.success("大模型已生成算法过程可视化，并将自动整理为详细 PDF 报告。")
+                    st.error("连接失败：请检查接口密钥、服务权限、账户额度，以及推理引擎名称是否可用。")
+                else:
+                    st.error("生成失败。快速模式下不会追加第二次修复调用，以免继续变慢。")
+                st.code(str(e)[:4000], language="text")
+                return
+        else:
+            elapsed = int(time.time() - float(st.session_state.get("generation_started_at", time.time())))
+            st.info(f"智能体正在生成算法可视化内容……已等待 {elapsed} 秒。点击侧栏“终止当前生成”可立即开启新会话。")
+            st.progress(min(95, 15 + (elapsed * 5) % 80))
+            time.sleep(0.8)
+            st.rerun()
 
     data = st.session_state.get("visualization_data")
     if not data:
         return
 
     if data.get("realtime_process_markdown"):
-        with st.expander("查看完整实时求解过程记录", expanded=False):
+        with st.expander("查看完整智能体工作流", expanded=False):
             st.markdown(data.get("realtime_process_markdown", ""))
 
-    st.markdown("## 自动识别结果")
+    st.markdown("## 智能体识别结果")
     c1, c2, c3 = st.columns(3)
     c1.metric("题目", data.get("task_title", "算法题目"))
     c2.metric("问题类型", data.get("detected_problem_type", "未识别"))
@@ -664,7 +899,7 @@ def main() -> None:
 
     algorithms = data.get("algorithms", []) or []
     if algorithms:
-        st.markdown("## 逐算法可视化")
+        st.markdown("## 逐帧算法可视化")
         tabs = st.tabs([alg.get("name", f"算法{i+1}") for i, alg in enumerate(algorithms)])
         for tab, alg in zip(tabs, algorithms):
             with tab:
@@ -693,25 +928,25 @@ def main() -> None:
 
     report = data.get("teaching_report_markdown", "")
     if report:
-        st.markdown("## 大模型生成的教学报告")
+        st.markdown("## 智能体生成的教学报告")
         st.markdown(report)
 
-    st.markdown("## 智能体自动输出 PDF")
-    st.info("PDF 已根据大模型生成的算法识别、求解步骤、可视化帧、关键变量和教学报告自动生成。用户只需要点击下载即可提交。")
+    st.markdown("## 智能体报告输出")
+    st.info("报告会根据算法识别、求解步骤、可视化帧、关键变量和教学内容自动生成。")
     pdf_path = st.session_state.get("pdf_path")
     if not pdf_path or not os.path.exists(pdf_path):
         pdf_path = make_pdf(data)
         st.session_state["pdf_path"] = pdf_path
     with open(pdf_path, "rb") as f:
         st.download_button(
-            label="下载智能体自动生成的详细 PDF 报告",
+            label="下载算法可视化智能体报告",
             data=f.read(),
-            file_name="算法过程可视化_智能体求解报告.pdf",
+            file_name="算法可视化智能体_求解报告.pdf",
             mime="application/pdf",
             use_container_width=True,
         )
 
-    with st.expander("查看大模型原始 JSON 输出"):
+    with st.expander("查看智能体结构化数据"):
         st.json(data)
 
 
