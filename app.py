@@ -30,7 +30,7 @@ from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 # =========================================================
 # 代码配置区：把你的 Key 填在这里
 # =========================================================
-CODE_OPENAI_API_KEY = ""  # 例如："sk-xpdideuepwpxalyhosclmczxzfbydlqelgarxlthigpimjfd"
+CODE_OPENAI_API_KEY = "sk-xpdideuepwpxalyhosclmczxzfbydlqelgarxlthigpimjfd"  # 例如："sk-xpdideuepwpxalyhosclmczxzfbydlqelgarxlthigpimjfd"
 CODE_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1"
 CODE_OPENAI_MODEL = "nex-agi/Nex-N2-Pro"
 
