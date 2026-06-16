@@ -43,7 +43,7 @@ from reportlab.platypus import (
 # ==========================================================
 # 注意：如果上传公开 GitHub，不建议把真实 Key 写进代码。
 # 课程本地演示可以直接在这里填写。
-CODE_OPENAI_API_KEY = ""  # 例如："sk-xxxxxxxxxxxxxxxxxxxxxxxx"
+CODE_OPENAI_API_KEY = "sk-xpdideuepwpxalyhosclmczxzfbydlqelgarxlthigpimjfd"  # 例如："sk-xxxxxxxxxxxxxxxxxxxxxxxx"
 CODE_OPENAI_BASE_URL = "https://api.siliconflow.cn/v1"
 CODE_OPENAI_MODEL = "nex-agi/Nex-N2-Pro"
 
